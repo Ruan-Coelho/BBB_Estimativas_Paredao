@@ -1,0 +1,259 @@
+# ——————————————————————————————————————————————————————————————————————————————
+# SMALL ROBUST ENSEMBLE (BBB) - RELATÓRIO DIAGNÓSTICO ABERTO ———————————————————
+# ——————————————————————————————————————————————————————————————————————————————
+
+# Carregando a biblioteca necessária
+library(tidyverse)
+
+#' Função de Otimização, Diagnóstico e Predição
+#' @param df_historico Tibble com o histórico.
+#' @param df_novo_paredao Tibble com as parciais do novo paredão.
+#' @param var_alvo Nome da coluna do resultado oficial.
+#' @param alpha Parâmetro de shrinkage (encolhimento).
+#' @param teto_peso Peso máximo permitido para uma única fonte (default: 0.6).
+relatorio_preditivo_bbb <- function(df_historico, df_novo_paredao, 
+                                    var_alvo = "Resultado_Oficial", 
+                                    alpha = 0.7, teto_peso = 0.6) {
+  
+y_real <- df_historico[[var_alvo]]
+fontes <- setdiff(names(df_historico), c("Paredao", var_alvo))
+n <- length(y_real)
+
+cat("\n===================================================================\n")
+cat("                RELATÓRIO DIAGNÓSTICO DO MODELO\n")
+cat("===================================================================\n\n")
+
+# ——————————————————————————————————————————————————————————————————————————————
+# ETAPA 1: AVALIAÇÃO BRUTA DAS FONTES (MAE HISTÓRICO) ——————————————————————————
+# ——————————————————————————————————————————————————————————————————————————————
+maes <- sapply(fontes, function(f) mean(abs(df_historico[[f]] - y_real), 
+                                        na.rm = TRUE))
+fontes_ranqueadas <- names(sort(maes))
+
+cat(">>> ETAPA 1: RANKING DE FONTES (ERRO ABSOLUTO MÉDIO - IN-SAMPLE)\n")
+tabela_maes <- tibble(Fonte = fontes_ranqueadas, 
+                      MAE_Bruto = round(sort(maes), 3))
+print(as.data.frame(tabela_maes), row.names = FALSE)
+cat("\n")
+
+# ——————————————————————————————————————————————————————————————————————————————
+# ETAPA 2: FORWARD SELECTION COM IC-MAE E SHRINKAGE ————————————————————————————
+# ——————————————————————————————————————————————————————————————————————————————
+resultados_modelos <- tibble()
+
+for (k in 2:length(fontes_ranqueadas)) {
+  top_k <- fontes_ranqueadas[1:k]
+  
+  # Aplica o Shrinkage (alpha)
+  inv_maes_penalizado <- (1 / maes[top_k])^alpha
+  pesos <- inv_maes_penalizado / sum(inv_maes_penalizado)
+  
+  # Aplica o Teto de Dominância Máxima (Clipping)
+  if (k > 1 && max(pesos) > teto_peso) {
+    idx_max <- which.max(pesos)
+    pesos[idx_max] <- teto_peso
+    
+    idx_outros <- setdiff(1:k, idx_max)
+    soma_outros <- sum(pesos[idx_outros])
+    if (soma_outros > 0) {
+      pesos[idx_outros] <- pesos[idx_outros] * ((1 - teto_peso) / soma_outros)
+    }
+  }
+  
+  # Erro do Ensemble
+  matriz_hist <- as.matrix(df_historico[top_k])
+  y_pred <- as.numeric(matriz_hist %*% pesos)
+  mae_ensemble <- mean(abs(y_real - y_pred))
+  
+  # Critério de Informação Modificado: n*ln(MAE) + k*ln(n)
+  ic_modificado <- n * log(mae_ensemble) + k * log(n)
+  
+  resultados_modelos <- bind_rows(resultados_modelos, tibble(
+    k = k,
+    Fontes = paste(top_k, collapse = " + "),
+    MAE_Modelo = mae_ensemble,
+    IC_Mod = ic_modificado,
+    Pesos_Lista = list(pesos)
+  ))
+}
+
+cat(">>> ETAPA 2: GRADE DE AVALIAÇÃO DE MODELOS (PENALIZAÇÃO DA COMPLEXIDADE)\n")
+grade_impressao <- resultados_modelos %>% 
+  select(k, MAE_Modelo, IC_Mod, Fontes) %>% 
+  mutate(MAE_Modelo = round(MAE_Modelo, 3), IC_Mod = round(IC_Mod, 3))
+print(as.data.frame(grade_impressao), row.names = FALSE)
+cat("\n")
+
+# ——————————————————————————————————————————————————————————————————————————————
+# ETAPA 3: SELEÇÃO COM REGRA DE ESTABILIDADE ESTRUTURAL ————————————————————————
+# ——————————————————————————————————————————————————————————————————————————————
+ic_minimo <- min(resultados_modelos$IC_Mod)
+
+# Regra de Parcimônia: Escolhe o menor k cujo IC seja no máximo IC_min + 2
+melhor_modelo <- resultados_modelos %>% 
+  filter(IC_Mod <= ic_minimo + 2) %>% 
+  arrange(k) %>% 
+  slice(1)
+
+fontes_otimas <- unlist(strsplit(melhor_modelo$Fontes, " \\+ "))
+pesos_otimos <- melhor_modelo$Pesos_Lista[[1]]
+
+cat(">>> ETAPA 3: SELEÇÃO DO MODELO ÓTIMO\n")
+cat(sprintf("Regra aplicada: Tolerância de Delta IC <= 2. (Mínimo IC = %.3f)\n", 
+            ic_minimo))
+cat(sprintf("Modelo Selecionado: k = %d (Garantindo máxima parcimônia)\n\n", 
+            melhor_modelo$k))
+
+cat("Pesos Finais Atribuídos (Ajustados por Alpha e Teto):\n")
+for(i in 1:length(fontes_otimas)) {
+  cat(sprintf(" - %s: %.1f%%\n", fontes_otimas[i], pesos_otimos[i] * 100))
+}
+cat("\n")
+
+# ——————————————————————————————————————————————————————————————————————————————
+# ETAPA 4: BACKTESTING IN-SAMPLE DO MODELO VENCEDOR ————————————————————————————
+# ——————————————————————————————————————————————————————————————————————————————
+matriz_vencedora <- as.matrix(df_historico[fontes_otimas])
+predicoes_historicas <- as.numeric(matriz_vencedora %*% pesos_otimos)
+
+tabela_backtest <- tibble(
+  Paredao = df_historico$Paredao,
+  Real = y_real,
+  Predito = round(predicoes_historicas, 2),
+  Residuo = round(y_real - predicoes_historicas, 2)
+)
+
+cat(">>> ETAPA 4: BACKTESTING RETROATIVO (ANÁLISE DE RESÍDUOS)\n")
+print(as.data.frame(tabela_backtest), row.names = FALSE)
+cat(sprintf("RMSE Global do Modelo: %.3f p.p.\n", 
+            sqrt(mean((y_real - predicoes_historicas)^2))))
+cat("\n")
+
+# ——————————————————————————————————————————————————————————————————————————————
+# ETAPA 5: PROJEÇÃO DO NOVO PAREDÃO ————————————————————————————————————————————
+# ——————————————————————————————————————————————————————————————————————————————
+concorrentes <- setdiff(names(df_novo_paredao), "Fonte")
+df_filtro_novo <- tibble(Fonte = fontes_otimas, Peso = pesos_otimos) %>%
+  left_join(df_novo_paredao, by = "Fonte")
+
+if(any(is.na(df_filtro_novo))) {
+  cat("\n[!] ALERTA CRÍTICO: Fontes exigidas pelo modelo não encontradas nos dados do novo paredão!\n")
+  return(NULL)
+}
+
+projecao_bruta <- df_filtro_novo %>%
+  summarise(across(all_of(concorrentes), ~ sum(.x * Peso, na.rm = TRUE)))
+
+projecao_final <- projecao_bruta %>%
+  mutate(across(everything(), ~ .x / sum(c_across(everything())) * 100)) %>%
+  round(2)
+
+cat("===================================================================\n")
+cat("                PROJEÇÃO OFICIAL (NOVO PAREDÃO)                    \n")
+cat("===================================================================\n")
+print(as.data.frame(projecao_final), row.names = FALSE)
+cat("===================================================================\n\n")
+
+# Retorna os dados silenciosamente para uso posterior no ambiente
+invisible(list(Modelo = melhor_modelo, Backtest = tabela_backtest, 
+               Projecao = projecao_final))
+}
+
+# ——————————————————————————————————————————————————————————————————————————————
+# EXEMPLO DE APLICAÇÃO PRÁTICA —————————————————————————————————————————————————
+# ——————————————————————————————————————————————————————————————————————————————
+
+# 1. Histórico Oficial (Alimentado semanalmente)
+# Propositalmente etou ignirando o primeiro paredão porque as fontes não haviam
+# se consolidade ainda, e o engajamento era menor, o que geraria maior ruído 
+historico <- tibble(
+  Paredao = c("P2 - Matheus", "P3 - Brígido", "P4 - Sarah", 
+              "P5 - Marcelo", "P6 - Maxiane", "P7 - Breno", "P8 - Babu"),
+  
+  Resultado_Oficial = c(79.48, 77.88, 69.13, 68.56, 63.21, 54.56, 68.62),
+  
+  # Fontes do Instagram
+  Insta_Aaron_Tura = c(75.00, 69.00, 60.00, 63.00, 58.00, 44.00, 62.00),
+  Insta_Bora_Comentar = c(79.00, 83.00, 76.00, 70.00, 79.00, 63.00, 80.00),
+  Insta_Gil_do_Vigor = c(83.00, 80.00, 74.00, 59.00, 70.00, 60.00, 72.00),
+  Insta_Gina_Indelicada = c(85.00, 78.00, 70.00, 59.00, 68.00, 60.00, 74.00),
+  Insta_Parciais_dos_Realities = c(64.00, 80.00, 79.00, 71.00, 70.00, 51.00, 78.00),
+  Insta_Parciais_Of_Reality = c(78.00, 76.00, 73.00, 73.00, 65.00, 51.53, 79.00),
+  Insta_Parcializada_R = c(79.00, 73.00, 71.00, 74.00, 74.00, 52.00, 84.00),
+  Media_Insta = c(77.81, 73.20, 69.33, 65.25, 65.07, 53.43, 70.33),
+  
+  # Fontes do X (Twitter)
+  X_Babi = c(90.50, 90.00, 84.10, 83.80, 80.10, 67.30, 89.30),
+  X_BarbaraSaryne = c(78.10, 73.40, 64.40, 77.40, 61.10, 18.00, 76.10),
+  X_CairoJardim = c(55.70, 56.10, 43.20, 78.00, 47.90, 24.60, 60.10),
+  X_CentralReality = c(82.30, 84.40, 79.10, 80.30, 74.10, 68.00, 84.90),
+  X_ChicoBarney = c(77.30, 76.10, 66.30, 78.30, 68.90, 49.40, 80.10),
+  X_Choquei = c(78.90, 78.00, 72.20, 74.60, 67.20, 49.80, 77.77),
+  X_Dantinhas = c(78.80, 80.40, 73.60, 75.10, 67.20, 55.40, 79.60),
+  X_DedeIntocavel = c(75.10, 74.20, 63.20, 74.80, 67.80, 47.60, 75.80),
+  X_DiegoSchueng = c(77.40, 69.50, 70.80, 77.90, 70.50, 42.60, 81.50),
+  X_GilDoVigor = c(84.50, 82.90, 81.10, 77.50, 71.70, 46.70, 80.40),
+  X_HugoGloss = c(87.50, 85.20, 80.00, 78.20, 77.40, 62.70, 83.80),
+  X_JeffMattias = c(90.10, 91.10, 82.20, 81.80, 85.00, 72.20, 91.00),
+  X_Jejezaum = c(82.70, 86.10, 81.60, 80.70, 77.70, 64.50, 87.20),
+  X_LalinhaFofoca = c(69.30, 70.80, 43.70, 79.90, 62.30, 41.60, 65.50),
+  X_ODiarioDeBrunaJ = c(76.10, 75.90, 68.50, 77.70, 67.60, 46.60, 75.50),
+  X_RealitysVip = c(79.20, 77.10, 71.70, 81.30, 74.20, 60.10, 82.70),
+  X_SeriesBrasil = c(88.50, 89.10, 79.40, 85.30, 79.40, 53.40, 88.50),
+  X_VaiDesmaiar = c(83.70, 86.40, 80.10, 81.20, 72.90, 66.50, 85.90),
+  X_Votalhada = c(75.30, 72.90, 64.50, 73.70, 64.80, 45.50, 69.70),
+  X_WebTVBrasileira = c(75.30, 73.70, 60.60, 70.70, 53.90, 33.10, 63.10),
+  Media_TW = c(80.74, 74.55, 66.04, 78.25, 68.20, 48.99, 77.77)
+)
+
+# 2. Dados do atual
+novo_paredao <- tibble(
+  Fonte = c("Media_Insta", "Insta_Parciais_Of_Reality"),
+  Babu = c(70.33, 79),
+  Milena = c(27.93, 20),
+  Chaiany = c(1.73, 1)
+)
+
+# 3. Execução do Relatório (Ajuste o alpha aqui para testar a sensibilidade)
+resultado <- relatorio_preditivo_bbb(historico, novo_paredao, alpha = 1, 
+                                     teto_peso = 1)
+
+# ——————————————————————————————————————————————————————————————————————————————
+# Criando gráfico com histórico ————————————————————————————————————————————————
+# ——————————————————————————————————————————————————————————————————————————————
+
+# Parcial 1
+resultado$Projecao %>%
+  # pivotando para grafico, mandando colunas para linha
+  pivot_longer(cols = everything(), names_to = "Concorrente", 
+               values_to = "Projecao") %>%
+  # Organizando ordem do factor, Babu, Milena e Chaiany
+  mutate(Concorrente = factor(Concorrente, 
+                              levels = c("Babu", "Milena", "Chaiany"))) %>%
+  ggplot(aes(x = Concorrente, y = Projecao, fill = Concorrente)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  # adicionando geom_text para mostrar os valores em cima das barras
+  geom_text(aes(label = paste0(scales::number(Projecao, decimal.mark = ",", 
+                                              accuracy = 0.01), "%")), 
+            position = position_dodge(width = 0.9), vjust = -0.5) +
+  labs(title = "BBB 26 - 8º Paredão: Estimativa de Percentual de Eliminação",
+       subtitle = "Quem você quer eliminar?",
+       caption = "Erro máximo histórico observado: 3,42 p.p.
+       Atualização: Terça-feira, 18h",
+       x = "", 
+       y = "") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.caption = element_text(size = 8, face = "italic"),
+        legend.text = element_text(size = 10),
+        plot.subtitle = element_text(size = 12),
+        plot.title = element_text(size = 16, face = "bold"),
+        axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(size = 14, face = "bold")) +
+  # aumentando a escala de y para ir até 100
+  scale_y_continuous(limits = c(0, 100)) +
+  # usando paleta pastel1
+  scale_fill_brewer(palette = "Pastel1")
+
+analise$Modelo_Vencedor$Pesos_Atribuidos
+
