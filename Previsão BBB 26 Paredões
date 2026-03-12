@@ -13,8 +13,9 @@ library(tidyverse)
 #' @param alpha Parâmetro de shrinkage (default: 0.7).
 #' @param teto_peso Peso máximo para evitar single-point of failure (0.6).
 ensemble_calibrado_bbb <- function(
-    df_historico, df_novo_paredao, var_alvo = "Resultado_Oficial", 
-    limite_sde = 5, alpha = 0.8, teto_peso = 1
+    df_historico, df_novo_paredao, var_alvo = "Resultado_Oficial",
+    alvo_novo = "Concorrente_A",
+    limite_sde = 4, alpha = 0.8, teto_peso = 1
 ) {
   
   y_real <- df_historico[[var_alvo]]
@@ -48,14 +49,20 @@ ensemble_calibrado_bbb <- function(
     
     if (aplicar_calibracao) {
       fator <- me
+      # Calibra o histórico
       df_hist_calibrado[[f]] <- df_historico[[f]] + fator
+      
+      # Calibra o novo paredão (dinamicamente)
       idx_fonte <- df_novo_calibrado$Fonte == f
-      df_novo_calibrado$Concorrente_A[idx_fonte] <- 
-        df_novo_calibrado$Concorrente_A[idx_fonte] + fator
+      if (alvo_novo %in% names(df_novo_calibrado)) {
+        df_novo_calibrado[[alvo_novo]][idx_fonte] <- 
+          df_novo_calibrado[[alvo_novo]][idx_fonte] + fator
+      } else {
+        warning(sprintf("ALERTA: Coluna '%s' não encontrada no novo paredão. Calibração não aplicada!", alvo_novo))
+      }
     } else {
       fator <- 0
     }
-    fatores_correcao[[f]] <- fator
   }
   
   # Calcula MAE calibrado
@@ -220,16 +227,17 @@ historico <- tibble(
 
 # 2. Dados do atual
 novo_paredao <- tibble(
-  Fonte = c("Media_Insta", "Insta_Parciais_Of_Reality"),
-  Babu = c(70.33, 79),
-  Milena = c(27.93, 20),
-  Chaiany = c(1.73, 1)
+  Fonte = c("Media_Insta", "Insta_Aaron_Tura"),
+  PessoaA = c(70.33, 79),
+  PessoaB = c(27.93, 20),
+  PessoaC = c(1.73, 1)
 )
 
-# 3. # Execução do modelo
+# 3. Execução do modelo (Indicando o alvo_novo)
 resultado <- ensemble_calibrado_bbb(
   df_historico = historico, 
-  df_novo_paredao = novo_paredao
+  df_novo_paredao = novo_paredao,
+  alvo_novo = "PessoaA" # Inserir novo alvo
 )
 
 
@@ -244,7 +252,7 @@ resultado$Projecao %>%
                values_to = "Projecao") %>%
   # Organizando ordem do factor, Babu, Milena e Chaiany
   mutate(Concorrente = factor(Concorrente, 
-                              levels = c("Babu", "Milena", "Chaiany"))) %>%
+                              levels = c("PessoaA", "PessoaB", "PessoaC"))) %>%
   ggplot(aes(x = Concorrente, y = Projecao, fill = Concorrente)) +
   geom_bar(stat = "identity", position = "dodge") +
   # adicionando geom_text para mostrar os valores em cima das barras
