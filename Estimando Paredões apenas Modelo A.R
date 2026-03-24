@@ -1,0 +1,327 @@
+# ——————————————————————————————————————————————————————————————————————————————
+# MODELO A (CASCATA): SELEÇÃO HEURÍSTICA COM IC-MAE E MÉDIA
+# ——————————————————————————————————————————————————————————————————————————————
+
+library(tidyverse)
+library(ggplot2)
+
+# 1. MOTOR CENTRAL DO ENSEMBLE (NÚCLEO DO MODELO A) ----------------------------
+#' Função base que calibra vieses e seleciona o melhor modelo via IC-MAE
+core_ensemble <- function(
+    df_hist, df_novo, var_alvo = "Alvo", 
+    limite_sde = 4, alpha = 0.8, teto_peso = 1
+) {
+  y_real <- df_hist[[var_alvo]]
+  # Remove identificadores para iterar apenas sobre as fontes numéricas
+  fontes <- setdiff(names(df_hist), c("Paredao", "Candidato", var_alvo))
+  n <- length(y_real)
+  
+  df_h_cal <- df_hist
+  df_n_cal <- df_novo
+  f_cor <- list()
+  
+  m_brutos <- sapply(fontes, function(f) {
+    mean(abs(df_hist[[f]] - y_real), na.rm = TRUE)
+  })
+  
+  # Estágio 1: Calibração de Viés
+  for (f in fontes) {
+    erros <- y_real - df_hist[[f]]
+    me <- mean(erros, na.rm = TRUE)
+    sde <- sd(erros, na.rm = TRUE)
+    
+    if ((sde <= limite_sde) && (abs(me) >= 0.5)) {
+      df_h_cal[[f]] <- df_hist[[f]] + me
+      df_n_cal[[f]] <- df_novo[[f]] + me
+      f_cor[[f]] <- me
+    } else {
+      f_cor[[f]] <- 0
+    }
+  }
+  
+  m_cal <- sapply(fontes, function(f) {
+    mean(abs(df_h_cal[[f]] - y_real), na.rm = TRUE)
+  })
+  
+  rank <- tibble(
+    Fonte = fontes, MAE_B = m_brutos, Shift = unlist(f_cor), MAE_C = m_cal
+  ) %>% arrange(MAE_C)
+  
+  f_ranq <- rank$Fonte
+  res_mod <- tibble()
+  
+  # TRATAMENTO DE DADOS FALTANTES (IMPUTAÇÃO NEUTRA) ---------------------------
+  # Substitui NAs pela média daquela linha específica para não quebrar a matriz
+  imputar_na_linha <- function(df) {
+    for(i in 1:nrow(df)) {
+      linha <- as.numeric(df[i, fontes])
+      if(any(is.na(linha))) df[i, fontes][is.na(linha)] <- mean(linha, na.rm=T)
+    }
+    return(df)
+  }
+  df_h_cal <- imputar_na_linha(df_h_cal)
+  df_n_cal <- imputar_na_linha(df_n_cal)
+  
+  # Estágio 2: Forward Selection e Critério de Informação
+  for (k in 2:length(f_ranq)) {
+    top_k <- f_ranq[1:k]
+    inv_m <- (1 / m_cal[top_k])^alpha
+    pesos <- inv_m / sum(inv_m)
+    
+    if (max(pesos) > teto_peso) {
+      id_m <- which.max(pesos)
+      pesos[id_m] <- teto_peso
+      id_o <- setdiff(1:k, id_m)
+      s_out <- sum(pesos[id_o])
+      if (s_out > 0) pesos[id_o] <- pesos[id_o] * ((1 - teto_peso)/s_out)
+    }
+    
+    mat_h <- as.matrix(df_h_cal[top_k])
+    y_p <- as.numeric(mat_h %*% pesos)
+    mae_e <- mean(abs(y_real - y_p))
+    ic <- n * log(mae_e) + k * log(n)
+    
+    res_mod <- bind_rows(res_mod, tibble(
+      k = k, MAE = mae_e, IC = ic,
+      Fontes = paste(top_k, collapse = " + "), Pesos = list(pesos)
+    ))
+  }
+  
+  ic_min <- min(res_mod$IC)
+  mod_opt <- res_mod %>% filter(IC <= ic_min + 2) %>% slice(1)
+  
+  f_opt <- unlist(strsplit(mod_opt$Fontes, " \\+ "))
+  p_opt <- mod_opt$Pesos[[1]]
+  
+  # Calcula Predição Histórica preservando chaves (Paredao, Candidato)
+  mat_h_opt <- as.matrix(df_h_cal[f_opt])
+  pred_h <- as.numeric(mat_h_opt %*% p_opt)
+  
+  df_backtest <- df_h_cal %>%
+    select(any_of(c("Paredao", "Candidato"))) %>%
+    mutate(Oficial = y_real, Predito = pred_h, Residuo = y_real - pred_h)
+  
+  mat_n <- as.matrix(df_n_cal[f_opt])
+  pred_f <- as.numeric(mat_n %*% p_opt)
+  
+  list(Rank = rank, Grade = res_mod, Mod = mod_opt, 
+       F_opt = f_opt, P_opt = p_opt, Pred = pred_f, Backtest = df_backtest)
+}
+
+
+# 2. FUNÇÃO CASCATA (WRAPPER HIERÁRQUICO COM DIAGNÓSTICO) ----------------------
+
+#' Imprime o diagnóstico completo para um nível específico da cascata
+imprimir_diagnostico <- function(res, nivel_nome) {
+  cat(sprintf("\n# %s: DIAGNÓSTICO DETALHADO ---------------------------\n", 
+              nivel_nome))
+  
+  cat(">>> ETAPA 1: RANKING DE FONTES E CALIBRAÇÃO ESTRUTURAL\n")
+  df_rank <- res$Rank %>% select(Fonte, MAE_B, Shift, MAE_C) %>%
+    mutate(across(where(is.numeric), ~round(.x, 3)))
+  print(as.data.frame(df_rank))
+  
+  cat("\n>>> ETAPA 2: GRADE DE AVALIAÇÃO DE MODELOS (PENALIZAÇÃO IC-MAE)\n")
+  df_grade <- res$Grade %>% select(k, MAE, IC, Fontes) %>%
+    mutate(across(where(is.numeric), ~round(.x, 3)))
+  print(as.data.frame(df_grade))
+  
+  cat("\n>>> ETAPA 3: SELEÇÃO DO MODELO ÓTIMO\n")
+  cat(sprintf("Regra: Delta IC <= 2. (Mínimo IC = %.3f)\n", min(res$Grade$IC)))
+  cat(sprintf("Modelo Selecionado: k = %d\n", res$Mod$k))
+  cat("Pesos Finais Atribuídos:\n")
+  for(i in seq_along(res$F_opt)) {
+    cat(sprintf(" - %s: %.1f%%\n", res$F_opt[i], res$P_opt[i]*100))
+  }
+  
+  cat("\n>>> ETAPA 4: BACKTESTING IN-SAMPLE DO MODELO SELECIONADO\n")
+  df_bk <- res$Backtest %>% mutate(across(where(is.numeric), ~round(.x, 2)))
+  print(as.data.frame(df_bk))
+  rmse_val <- sqrt(mean(res$Backtest$Residuo^2))
+  cat(sprintf("RMSE Global do Sistema: %.3f p.p.\n", rmse_val))
+}
+
+#' Orquestra o Nível 1 (Eliminado) e o Nível 2 (Share Relativo do Resto)
+ensemble_cascata_bbb <- function(df_hist_long, df_novo_long) {
+  
+  fontes <- setdiff(names(df_hist_long), 
+                    c("Paredao", "Candidato", "Posicao", "Oficial"))
+  
+  df_novo_long <- df_novo_long %>% arrange(Posicao)
+  cands <- df_novo_long$Candidato
+  
+  # NÍVEL 1: PREVISÃO DO ELIMINADO 
+  df_h1 <- df_hist_long %>% filter(Posicao == 1) %>%
+    select(Paredao, Candidato, Alvo = Oficial, all_of(fontes))
+  df_n1 <- df_novo_long %>% filter(Posicao == 1) %>% select(all_of(fontes))
+  
+  res_1 <- core_ensemble(df_h1, df_n1)
+  pred_1 <- res_1$Pred
+  
+  imprimir_diagnostico(res_1, "NÍVEL 1 (ALVO PRINCIPAL)")
+  cat(sprintf("\n[!] PROJEÇÃO NÍVEL 1 (%s): %.2f%%\n", cands[1], pred_1))
+  
+  # NÍVEL 2: DISPUTA RELATIVA 
+  calc_share <- function(x) { x[1] / (x[1] + x[2]) * 100 }
+  
+  df_h2 <- df_hist_long %>% filter(Posicao %in% c(2, 3)) %>%
+    arrange(Paredao, Posicao) %>% group_by(Paredao) %>%
+    summarise(Candidato = Candidato[1], # Mantém o nome do 2º colocado
+              Alvo = calc_share(Oficial),
+              across(all_of(fontes), calc_share), .groups = "drop")
+  
+  df_n2 <- df_novo_long %>% filter(Posicao %in% c(2, 3)) %>%
+    arrange(Posicao) %>% summarise(across(all_of(fontes), calc_share))
+  
+  res_2 <- core_ensemble(df_h2, df_n2)
+  share_2 <- res_2$Pred / 100 
+  
+  imprimir_diagnostico(res_2, "NÍVEL 2 (SHARE RELATIVO 2º VS 3º)")
+  cat(sprintf("\n[!] SHARE RELATIVO DE %s SOBRE %s: %.1f%%\n", 
+              toupper(cands[2]), toupper(cands[3]), share_2 * 100))
+  
+  # PROJEÇÃO FINAL RECOMPOSTA
+  cat("\n# RECOMPOSIÇÃO DO SIMPLEX (100%) --------------------------------\n")
+  
+  pred_2 <- (100 - pred_1) * share_2
+  pred_3 <- (100 - pred_1) * (1 - share_2)
+  
+  t_final <- tibble(
+    Posicao = c(1, 2, 3), Candidato = cands,
+    Projecao = round(c(pred_1, pred_2, pred_3), 2)
+  )
+  
+  print(as.data.frame(t_final), row.names = FALSE)
+  cat("\n")
+  
+  invisible(list(N1 = res_1, N2 = res_2, Final = t_final))
+}
+
+
+# 3. VISUALIZAÇÃO DINÂMICA (GRÁFICO) -------------------------------------------
+
+#' Plota a estimativa do paredão atual extraindo dados dinamicamente
+plotar_projecao_mod_a <- function(res_modelo, num_paredao) {
+  
+  df_plot <- res_modelo$Final %>%
+    mutate(Candidato = factor(Candidato, levels = Candidato))
+  
+  # Acessa o Backtest exportado dentro da lista do Nível 1
+  erro_max <- max(abs(res_modelo$N1$Backtest$Residuo), na.rm = TRUE)
+  data_atual <- format(Sys.time(), "%A, %Hh%M")
+  teto_y <- max(df_plot$Projecao) + 15 
+  
+  p <- ggplot(df_plot, aes(x = Candidato, y = Projecao, fill = Candidato)) +
+    geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+    geom_text(
+      aes(label = paste0(scales::number(Projecao, decimal.mark = ",", 
+                                        accuracy = 0.01), "%")),
+      size = 8, vjust = -0.5, fontface = "bold", color = "gray20"
+    ) +
+    labs(
+      title = sprintf("BBB 26 - %dº Paredão", num_paredao),
+      subtitle = "Estimativa Heurística de Votos (Modelo A - Cascata)",
+      caption = sprintf(
+        "Erro retroativo máximo histórico (Nível 1): %.2f p.p.\nAtualização: %s", 
+        erro_max, data_atual
+      ),
+      x = "", y = ""
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      plot.caption = element_text(size=10, face="italic", hjust=1, 
+                                  color="gray40"),
+      plot.subtitle = element_text(size=16, margin=margin(b=20), 
+                                   color="gray30"),
+      plot.title = element_text(size=22, face="bold"),
+      axis.text.y = element_blank(),
+      axis.text.x = element_text(size=20, face="bold"),
+      panel.grid = element_blank()
+    ) +
+    scale_y_continuous(limits = c(0, teto_y)) +
+    scale_fill_brewer(palette = "Pastel1")
+  
+  print(p)
+}
+
+
+# 4. ALIMENTAÇÃO DE DADOS (COM CÁLCULO VETORIZADO DA MÉDIA) --------------------
+# O cálculo `Media` ao final do bind_rows garante que a média seja feita 
+# corretamente por linha, adicionando uma nova fonte preditiva.
+hist_cascata <- bind_rows(
+  tibble(Paredao="P2", Candidato="Matheus", Posicao=1, Oficial=79.48,
+         Insta=77.81, X=80.74, YT=66.42),
+  tibble(Paredao="P2", Candidato="Leandro", Posicao=2, Oficial=15.55,
+         Insta=12.63, X=14.12, YT=20.54),
+  tibble(Paredao="P2", Candidato="Brigido", Posicao=3, Oficial=4.97,
+         Insta=9.56,  X=5.14,  YT=13.04),
+  
+  tibble(Paredao="P3", Candidato="Brigido", Posicao=1, Oficial=77.88,
+         Insta=73.20, X=74.55, YT=58.40),
+  tibble(Paredao="P3", Candidato="Leandro", Posicao=2, Oficial=12.04,
+         Insta=16.40, X=21.19, YT=23.60),
+  tibble(Paredao="P3", Candidato="A_Paula", Posicao=3, Oficial=10.08,
+         Insta=10.40, X=4.27,  YT=18.00),
+  
+  tibble(Paredao="P4", Candidato="Sarah",   Posicao=1, Oficial=69.13,
+         Insta=69.33, X=66.04, YT=50.24),
+  tibble(Paredao="P4", Candidato="Babu",    Posicao=2, Oficial=28.49,
+         Insta=23.07, X=25.44, YT=42.92),
+  tibble(Paredao="P4", Candidato="Sol",     Posicao=3, Oficial=2.38,
+         Insta=7.60,  X=8.52,  YT=6.84),
+  
+  tibble(Paredao="P5", Candidato="Marcelo", Posicao=1, Oficial=68.56,
+         Insta=65.25, X=78.25, YT=66.00),
+  tibble(Paredao="P5", Candidato="Samira",  Posicao=2, Oficial=16.25,
+         Insta=17.08, X=10.27, YT=20.09),
+  tibble(Paredao="P5", Candidato="Solange", Posicao=3, Oficial=15.39,
+         Insta=17.67, X=11.47, YT=13.95),
+  
+  tibble(Paredao="P6", Candidato="Maxiane", Posicao=1, Oficial=63.21,
+         Insta=65.07, X=68.20, YT=52.17),
+  tibble(Paredao="P6", Candidato="Milena",  Posicao=2, Oficial=36.11,
+         Insta=33.27, X=26.93, YT=42.55),
+  tibble(Paredao="P6", Candidato="Chaiany", Posicao=3, Oficial=0.68,
+         Insta=1.67,  X=4.86,  YT=5.33),
+  
+  tibble(Paredao="P7", Candidato="Breno",   Posicao=1, Oficial=54.66,
+         Insta=53.43, X=48.99, YT=43.55),
+  tibble(Paredao="P7", Candidato="Cowboy",  Posicao=2, Oficial=43.12,
+         Insta=41.29, X=42.72, YT=53.14),
+  tibble(Paredao="P7", Candidato="Jordana", Posicao=3, Oficial=2.22,
+         Insta=5.29,  X=8.29,  YT=3.25),
+  
+  tibble(Paredao="P8", Candidato="Babu",    Posicao=1, Oficial=68.62,
+         Insta=70.33, X=77.77, YT=57.63),
+  tibble(Paredao="P8", Candidato="Milena",  Posicao=2, Oficial=30.91,
+         Insta=27.93, X=13.49, YT=38.24),
+  tibble(Paredao="P8", Candidato="Chaiany", Posicao=3, Oficial=0.47,
+         Insta=1.73,  X=8.75,  YT=4.58),
+  
+  tibble(Paredao="P9", Candidato="Breno",   Posicao=1, Oficial=58.96,
+         Insta=55.38, X=63.33, YT=48.16),
+  tibble(Paredao="P9", Candidato="A_Paula", Posicao=2, Oficial=25.17,
+         Insta=16.13, X=13.84, YT=31.32),
+  tibble(Paredao="P9", Candidato="Leandro", Posicao=3, Oficial=15.87,
+         Insta=28.50, X=22.82, YT=20.18)
+) %>%
+  mutate(Media = round((Insta + X + YT) / 3, 2))
+
+novo_cascata <- tibble(
+  Candidato = c("Jonas", "Juliano", "Gabriela"),
+  Posicao   = c(1, 2, 3), 
+  Insta     = c(50.56, 32.06, 17.38),
+  X         = c(55.92, 38.19,  5.90),
+  YT        = c(35.87, 51.05, 13.52)
+) %>%
+  mutate(Media = round((Insta + X + YT) / 3, 2))
+
+
+# 5. EXECUÇÃO DO MODELO A E PLOTAGEM -------------------------------------------
+
+# 1. Roda a inferência (O algoritmo avaliará "Media" como uma nova fonte)
+resultado_modelo_A <- ensemble_cascata_bbb(hist_cascata, novo_cascata)
+
+# 2. Desenha o Gráfico 
+plotar_projecao_mod_a(resultado_modelo_A, num_paredao = 10)
