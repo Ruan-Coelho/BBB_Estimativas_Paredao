@@ -12,7 +12,7 @@ logit <- function(p) {
 }
 inv_logit <- function(x) exp(x) / (1 + exp(x))
 
-# 2. ORQUESTRADOR DO MODELO EM CASCATA 
+# 2. ORIENTADOR DO MODELO EM CASCATA 
 ridge_cascata_bbb <- function(df_hist, df_novo) {
   
   if (!"Posicao" %in% names(df_novo)) {
