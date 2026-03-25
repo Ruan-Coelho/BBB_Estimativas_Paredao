@@ -1,5 +1,5 @@
 # ——————————————————————————————————————————————————————————————————————————————
-# MODELO B (CASCATA): RIDGE ESTRUTURAL COM LOGIT CONDICIONAL ####
+# MODELO B (CASCATA): RIDGE ESTRUTURAL COM LOGIT CONDICIONAL -------------------
 # ——————————————————————————————————————————————————————————————————————————————
 pacman::p_load(tidyverse, glmnet, ggplot2)
 
@@ -168,8 +168,7 @@ plotar_projecao_bbb <- function(res_modelo, num_paredao) {
     geom_text(
       aes(label = paste0(scales::number(Projecao, decimal.mark = ",", 
                                         accuracy = 0.01), "%")),
-      size = 8, vjust = -0.5, fontface = "bold", color = "gray20"
-    ) +
+      size = 8, vjust = -0.5) +
     labs(
       title = sprintf("BBB 26 - %dº Paredão", num_paredao),
       subtitle = "Estimativa Estrutural de Votos para Eliminação",
@@ -182,13 +181,11 @@ plotar_projecao_bbb <- function(res_modelo, num_paredao) {
     theme_minimal() +
     theme(
       legend.position = "none",
-      plot.caption = element_text(size = 10, face = "italic", hjust = 1, 
-                                  color = "gray40"),
-      plot.subtitle = element_text(size = 16, margin = margin(b = 20), 
-                                   color = "gray30"),
-      plot.title = element_text(size = 22, face = "bold"),
+      plot.caption = element_text(size = 10, face = "italic", hjust = 1),
+      plot.subtitle = element_text(size = 16, margin = margin(b = 20)),
+      plot.title = element_text(size = 22),
       axis.text.y = element_blank(),
-      axis.text.x = element_text(size = 20, face = "bold"),
+      axis.text.x = element_text(size = 20),
       panel.grid = element_blank()
     ) +
     scale_y_continuous(limits = c(0, teto_y)) +
@@ -254,11 +251,18 @@ historico_empilhado <- bind_rows(
   tibble(Paredao="P9", Candidato="Ana Paula", 
          Posicao=2, Oficial=25.17, Insta=16.13, X=13.84, YT=31.32),
   tibble(Paredao="P9", Candidato="Leandro",   
-         Posicao=3, Oficial=15.87, Insta=28.50, X=22.82, YT=20.18)
+         Posicao=3, Oficial=15.87, Insta=28.50, X=22.82, YT=20.18),
+  
+  tibble(Paredao="P10", Candidato="Jonas",     
+         Posicao=1, Oficial=53.48, Insta=50.41, X=55.76, YT=38.64),
+  tibble(Paredao="P10", Candidato="Juliano", 
+         Posicao=2, Oficial=43.49, Insta=36.12, X=38.75, YT=50.32),
+  tibble(Paredao="P10", Candidato="Gabriela",   
+         Posicao=3, Oficial=3.03, Insta=13.47, X=5.49, YT=16.60)
 )
 
 novo_paredao_empilhado <- tibble(
-  Candidato = c("Jonas", "Juliano", "Gabriela"),
+  Candidato = c("Pessoa1", "Pessoa2", "Pesso3"),
   Insta     = c(50.56, 32.06, 17.38),
   X         = c(55.92, 38.19, 5.09),
   YT        = c(35.87, 51.05, 13.52)
